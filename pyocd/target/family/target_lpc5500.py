@@ -24,6 +24,8 @@ from ...coresight.cortex_m import CortexM
 from ...coresight.cortex_m_v8m import CortexM_v8M
 from ...debug.svd.loader import SVDFile
 from ...utility import timeout
+from ...coresight.ap import (APv1Address, APv2Address, AccessPort)
+from ...core import exceptions
 
 FPB_CTRL                = 0xE0002000
 FPB_COMP0               = 0xE0002008
@@ -57,6 +59,9 @@ class LPC5500Family(CoreSightTarget):
         
         seq.wrap_task('discovery',
             lambda seq: seq
+                    .insert_before('find_aps',
+                        ('resynchronize_dm_ap', self.resynchronize_dm_ap),
+                        ) \
                     .wrap_task('find_components', self._modify_ap1) \
                     .replace_task('create_cores', self.create_lpc55xx_cores) \
                     .insert_before('create_components',
@@ -66,6 +71,41 @@ class LPC5500Family(CoreSightTarget):
         
         return seq
     
+    def resynchronize_dm_ap(self):
+        if 2 not in self.aps:
+            ap_address = APv1Address(2)
+            ap = AccessPort.create(self.dp, ap_address)
+        else:
+            ap = self.aps[2]
+
+        LOG.debug("Resynchronizing dm_ap")
+        value = -1
+        while value != 0x002A0000:
+            try:
+                value = ap.read_reg(0xFC)
+            except exceptions.TransferFaultError:
+                pass
+        # Write DM RESYNC_REQ + CHIP_RESET_REQ
+        LOG.debug("Sending resync RQ")
+        ap.write_reg(0x00, 0x21)
+        value = -1
+        while value != 0:
+            try:
+                value = ap.read_reg(0x00)
+            except exceptions.TransferTimeoutError:
+                pass
+        LOG.debug("Resync success")
+
+        # Write DM START_DBG_SESSION to REQUEST register (1)
+        ap.write_reg(0x04, 0x07)
+        value = -1
+        while value != 0:
+            try:
+                value = ap.read_reg(0x08) & 0xFFFF
+            except exceptions.TransferTimeoutError:
+                pass
+        LOG.debug("Debug session start success")
+
     def _modify_ap1(self, seq):
         # If AP#1 exists we need to adjust it before we can read the ROM.
         if seq.has_task('init_ap.1'):
@@ -196,7 +236,23 @@ class CortexM_LPC5500(CortexM_v8M):
             # Read DHCSR to clear potentially set DHCSR.S_RESET_ST bit
             self.read32(CortexM.DHCSR)
 
-        self.reset(reset_type)
+        self.session.notify(Target.Event.PRE_RESET, self)
+
+        reset_type = self._get_actual_reset_type(reset_type)
+
+        LOG.debug("reset, core %d, type=%s", self.core_number, reset_type.name)
+
+        self._run_token += 1
+
+        # Give the delegate a chance to overide reset. If the delegate returns True, then it
+        # handled the reset on its own.
+        if not self.call_delegate('will_reset', core=self, reset_type=reset_type):
+            self._perform_reset(reset_type)
+
+        self.call_delegate('did_reset', core=self, reset_type=reset_type)
+
+        self.session.target.resynchronize_dm_ap()
+        self.session.target.halt()
 
         # wait until the unit resets
         with timeout.Timeout(2.0) as t_o:
