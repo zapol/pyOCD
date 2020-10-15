@@ -81,12 +81,27 @@ class DWT(CoreSightComponent):
                             7: Target.WatchpointType.READ_WRITE,
                             }
 
+    LAR = 0x00001fb0
+    LAR_KEY = 0xC5ACCE55
+    LSR = 0x00001fb4
+    LSR_SLK_MASK = (1 << 1)
+    LSR_SLI_MASK = (1 << 0)
+
     # Only sizes that are powers of 2 are supported
     # Breakpoint size = MASK**2
     WATCH_SIZE_TO_MASK = dict((2**i, i) for i in range(0,32))
 
     def __init__(self, ap, cmpid=None, addr=None):
         super(DWT, self).__init__(ap, cmpid, addr)
+
+        # Unlock if required.
+        val = self.ap.read32(self.address + DWT.LSR)
+        if (val & (DWT.LSR_SLK_MASK | DWT.LSR_SLI_MASK)) == (DWT.LSR_SLK_MASK | DWT.LSR_SLI_MASK):
+            self.ap.write32(self.address + DWT.LAR, DWT.LAR_KEY)
+            val = self.ap.read32(self.address + DWT.LSR)
+            if val & DWT.LSR_SLK_MASK:
+                raise exceptions.DebugError("Failed to unlock DWT")
+
         self.watchpoints = []
         self.watchpoint_used = 0
         self.dwt_configured = False

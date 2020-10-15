@@ -173,24 +173,28 @@ class LPC5500Family(CoreSightTarget):
         self._enable_traceclk()
 
 class CortexM_LPC5500(CortexM_v8M):
+    _flash_erased = True
 
-    def reset_and_halt(self, reset_type=None):
-        """! @brief Perform a reset and stop the core on the reset handler. """
-        
-        catch_mode = 0
-        
-        delegateResult = self.call_delegate('set_reset_catch', core=self, reset_type=reset_type)
-        
-        # Save CortexM.DEMCR
-        demcr = self.read_memory(CortexM.DEMCR)
+    def set_reset_catch(self, reset_type=None):
+        """! @brief Prepare to halt core on reset."""
+        LOG.debug("set reset catch, core %d", self.core_number)
 
-        # enable the vector catch
-        if not delegateResult:
+        self._reset_catch_mode = 0
+
+        self._reset_catch_delegate_result = self.call_delegate('set_reset_catch', core=self, reset_type=reset_type)
+
+        # Default behaviour if the delegate didn't handle it.
+        if not self._reset_catch_delegate_result:
+            self.halt()
+            
+            # Save CortexM.DEMCR.
+            self._reset_catch_saved_demcr = self.read_memory(CortexM.DEMCR)
+
             # This sequence is copied from the NXP LPC55S69_DFP debug sequence.
             reset_vector = 0xFFFFFFFF
             
             # Clear reset vector catch.
-            self.write32(CortexM.DEMCR, demcr & ~CortexM.DEMCR_VC_CORERESET)
+            self.write32(CortexM.DEMCR, self._reset_catch_saved_demcr & ~CortexM.DEMCR_VC_CORERESET)
             
             # If the processor is in Secure state, we have to access the flash controller
             # through the secure alias.
@@ -222,20 +226,42 @@ class CortexM_LPC5500(CortexM_v8M):
 
             # Break on user application reset vector if we have a valid breakpoint address.
             if reset_vector != 0xFFFFFFFF:
-                catch_mode = 1
+                self._flash_erased=False
+                print("Code exists in flash!!!")
+                self._reset_catch_mode = 1
                 self.write32(FPB_COMP0, reset_vector|1) # Program FPB Comparator 0 with reset handler address
                 self.write32(FPB_CTRL, 0x00000003)    # Enable FPB
             # No valid user application so use watchpoint to break at end of boot ROM. The ROM
             # writes a special address to signal when it's done.
             else:
-                catch_mode = 2
-                self.write32(DWT_FUNCTION0, 0)
-                self.write32(DWT_COMP0, BOOTROM_MAGIC_ADDR)
-                self.write32(DWT_FUNCTION0, (DWT_FUNCTION_MATCH | DWT_FUNCTION_ACTION | DWT_FUNCTION_DATAVSIZE))
+                self._flash_erased=True
+                print("Flash is empty!!!")
+                self._reset_catch_mode = 2
+                # self.write32(FPB_COMP0, BOOTROM_MAGIC_ADDR) # Program FPB Comparator 0 with reset handler address
+                # self.write32(FPB_CTRL, 0x00000003)    # Enable FPB
+                self.dwt.set_watchpoint(BOOTROM_MAGIC_ADDR, 4, Target.WatchpointType.READ_WRITE)
+                # self.write32(DWT_FUNCTION0, 0)
+                # self.write32(DWT_COMP0, BOOTROM_MAGIC_ADDR)
+                # self.write32(DWT_FUNCTION0, (DWT_FUNCTION_MATCH | DWT_FUNCTION_ACTION | DWT_FUNCTION_DATAVSIZE))
 
             # Read DHCSR to clear potentially set DHCSR.S_RESET_ST bit
             self.read32(CortexM.DHCSR)
 
+    def reset(self, reset_type=None):
+        """! @brief Reset the core.
+
+        The reset method is selectable via the reset_type parameter as well as the reset_type
+        session option. If the reset_type parameter is not specified or None, then the reset_type
+        option will be used. If the option is not set, or if it is set to a value of 'default', the
+        the core's default_reset_type property value is used. So, the session option overrides the
+        core's default, while the parameter overrides everything.
+
+        Note that only v7-M cores support the `VECTRESET` software reset method. If this method
+        is chosen but the core doesn't support it, the the reset method will fall back to an
+        emulated software reset.
+
+        After a call to this function, the core is running.
+        """
         self.session.notify(Target.Event.PRE_RESET, self)
 
         reset_type = self._get_actual_reset_type(reset_type)
@@ -246,35 +272,45 @@ class CortexM_LPC5500(CortexM_v8M):
 
         # Give the delegate a chance to overide reset. If the delegate returns True, then it
         # handled the reset on its own.
+        print("Doing reset the LPC5500 family way")
         if not self.call_delegate('will_reset', core=self, reset_type=reset_type):
             self._perform_reset(reset_type)
 
+        print("dupa")
+
+        if self._flash_erased:
+            print("Resynchronizing dm_ap")
+            self.session.target.resynchronize_dm_ap()
+
         self.call_delegate('did_reset', core=self, reset_type=reset_type)
 
-        self.session.target.resynchronize_dm_ap()
-        self.session.target.halt()
-
-        # wait until the unit resets
+        # Now wait for the system to come out of reset. Keep reading the DHCSR until
+        # we get a good response with S_RESET_ST cleared, or we time out.
         with timeout.Timeout(2.0) as t_o:
             while t_o.check():
-                if self.get_state() not in (Target.State.RESET, Target.State.RUNNING):
-                    break
-                sleep(0.01)
+                try:
+                    dhcsr = self.read32(CortexM.DHCSR)
+                    if (dhcsr & CortexM.S_RESET_ST) == 0:
+                        break
+                except exceptions.TransferError:
+                    self.flush()
+                    sleep(0.01)
 
-        # Make sure the thumb bit is set in XPSR in case the reset handler
-        # points to an invalid address.
-        xpsr = self.read_core_register('xpsr')
-        if xpsr is not None and xpsr & self.XPSR_THUMB == 0:
-            self.write_core_register('xpsr', xpsr | self.XPSR_THUMB)
+        self.session.notify(Target.Event.POST_RESET, self)
+
+    def clear_reset_catch(self, reset_type=None):
+        """! @brief Disable halt on reset."""
+        LOG.debug("clear reset catch, core %d", self.core_number)
 
         self.call_delegate('clear_reset_catch', core=self, reset_type=reset_type)
 
-        # Clear breakpoint or watchpoint.
-        if catch_mode == 1:
-            self.write32(0xE0002008, 0)
-        elif catch_mode == 2:
-            self.write32(DWT_COMP0, 0)
-            self.write32(DWT_FUNCTION0, 0)
+        if not self._reset_catch_delegate_result:
+            # Clear breakpoint or watchpoint.
+            if self._reset_catch_mode == 1:
+                self.write32(0xE0002008, 0)
+            elif self._reset_catch_mode == 2:
+                self.write32(DWT_COMP0, 0)
+                self.write32(DWT_FUNCTION0, 0)
 
-        # restore vector catch setting
-        self.write_memory(CortexM.DEMCR, demcr)
+            # restore vector catch setting
+            self.write_memory(CortexM.DEMCR, self._reset_catch_saved_demcr)

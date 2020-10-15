@@ -65,7 +65,7 @@ FLASH_ALGO = {
 
     # Flash information
     'flash_start': 0x0,
-    'flash_size': 0x40000,
+    'flash_size': 0x3D000,
     'sector_sizes': (
         (0x0, 0x8000),
     )
@@ -74,7 +74,7 @@ FLASH_ALGO = {
 class LPC5516(LPC5500Family):
 
     MEMORY_MAP = MemoryMap(
-        FlashRegion(name='nsflash',     start=0x00000000, length=0x00040000, access='rx',
+        FlashRegion(name='nsflash',     start=0x00000000, length=0x3D000, access='rx',
             blocksize=0x200,
             is_boot_memory=True,
             are_erased_sectors_readable=False,
