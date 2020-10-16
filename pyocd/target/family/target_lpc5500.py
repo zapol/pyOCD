@@ -23,7 +23,7 @@ from ...core.memory_map import (FlashRegion, RamRegion, RomRegion, MemoryMap)
 from ...coresight.cortex_m import CortexM
 from ...coresight.cortex_m_v8m import CortexM_v8M
 from ...debug.svd.loader import SVDFile
-from ...utility import timeout
+from ...utility import timeout, conversion
 from ...coresight.ap import (APv1Address, APv2Address, AccessPort)
 from ...core import exceptions
 
@@ -175,6 +175,81 @@ class LPC5500Family(CoreSightTarget):
 class CortexM_LPC5500(CortexM_v8M):
     _flash_erased = True
 
+    def is_flash_addr(self, addr, length):
+        mem_map = self.get_memory_map()
+        region = mem_map.get_region_for_address(addr)
+        if (region is None) or (not region.is_flash):
+            return False
+
+        return region.contains_range(addr, length=length)
+
+    def is_flash_erased(self, addr, length):
+        # If the processor is in Secure state, we have to access the flash controller
+        # through the secure alias.
+        if self.get_security_state() == Target.SecurityState.SECURE:
+            base = PERIPHERAL_BASE_S
+        else:
+            base = PERIPHERAL_BASE_NS
+
+        # Use the flash programming model to check if the first flash page is readable, since
+        # attempted accesses to erased pages result in bus faults. The start and stop address
+        # are both set to 0x0 to probe the sector containing the reset vector.
+        self.write32(base + FLASH_STARTA, addr) # Program flash word start address to 0x0
+        self.write32(base + FLASH_STOPA, addr + length - 1) # Program flash word stop address to 0x0
+        self.write_memory_block32(base + FLASH_DATAW0, [0x00000000] * 8) # Prepare for read
+        self.write32(base + FLASH_INT_CLR_STATUS, 0x0000000F) # Clear Flash controller status
+        self.write32(base + FLASH_CMD, FLASH_CMD_READ_SINGLE_WORD) # Read single flash word
+
+        # Wait for flash word read to finish.
+        with timeout.Timeout(5.0) as t_o:
+            while t_o.check():
+                if (self.read32(base + FLASH_INT_STATUS) & 0x00000004) != 0:
+                    break
+                sleep(0.01)
+        
+        # Check for error reading flash word.
+        if (self.read32(base + FLASH_INT_STATUS) & 0xB) == 0:
+            return False
+        
+        print("0x%08X %d bytes are Erased" % (addr, length))
+        return True
+
+
+    def read_memory(self, addr, transfer_size=32, now=True):
+        """! @brief Read an aligned block of 32-bit words."""
+        if transfer_size == 8:
+            data = self.read_memory_block8(addr, 1)[0]
+        elif transfer_size == 16:
+            data = conversion.byte_list_to_u16le_list(self.read_memory_block8(addr, 2))[0]
+        elif transfer_size == 32:
+            data = self.read_memory_block32(addr, 1)[0]
+            
+        if now:
+            return data
+        else:
+            def read_cb():
+                return data
+            return read_cb
+
+    def read_memory_block32(self, addr, size):
+        """! @brief Read an aligned block of 32-bit words."""
+        if self.is_flash_addr(addr, size*4):
+            if self.is_flash_erased(addr, size*4):
+                return [0xFFFFFFFF] * size
+
+        return self.ap.read_memory_block32(addr, size)
+
+    def read_memory_block8(self, addr, size):
+        """! @brief Read a block of unaligned bytes in memory.
+        @return an array of byte values
+        """
+        if self.is_flash_addr(addr, size):
+            if self.is_flash_erased(addr, size):
+                return [0xFF] * size
+
+        data = self.ap.read_memory_block8(addr, size)
+        return self.bp_manager.filter_memory_unaligned_8(addr, size, data)
+
     def set_reset_catch(self, reset_type=None):
         """! @brief Prepare to halt core on reset."""
         LOG.debug("set reset catch, core %d", self.core_number)
@@ -196,33 +271,33 @@ class CortexM_LPC5500(CortexM_v8M):
             # Clear reset vector catch.
             self.write32(CortexM.DEMCR, self._reset_catch_saved_demcr & ~CortexM.DEMCR_VC_CORERESET)
             
-            # If the processor is in Secure state, we have to access the flash controller
-            # through the secure alias.
-            if self.get_security_state() == Target.SecurityState.SECURE:
-                base = PERIPHERAL_BASE_S
-            else:
-                base = PERIPHERAL_BASE_NS
+            # # If the processor is in Secure state, we have to access the flash controller
+            # # through the secure alias.
+            # if self.get_security_state() == Target.SecurityState.SECURE:
+            #     base = PERIPHERAL_BASE_S
+            # else:
+            #     base = PERIPHERAL_BASE_NS
             
-            # Use the flash programming model to check if the first flash page is readable, since
-            # attempted accesses to erased pages result in bus faults. The start and stop address
-            # are both set to 0x0 to probe the sector containing the reset vector.
-            self.write32(base + FLASH_STARTA, 0x00000000) # Program flash word start address to 0x0
-            self.write32(base + FLASH_STOPA, 0x00000000) # Program flash word stop address to 0x0
-            self.write_memory_block32(base + FLASH_DATAW0, [0x00000000] * 8) # Prepare for read
-            self.write32(base + FLASH_INT_CLR_STATUS, 0x0000000F) # Clear Flash controller status
-            self.write32(base + FLASH_CMD, FLASH_CMD_READ_SINGLE_WORD) # Read single flash word
+            # # Use the flash programming model to check if the first flash page is readable, since
+            # # attempted accesses to erased pages result in bus faults. The start and stop address
+            # # are both set to 0x0 to probe the sector containing the reset vector.
+            # self.write32(base + FLASH_STARTA, 0x00000000) # Program flash word start address to 0x0
+            # self.write32(base + FLASH_STOPA, 0x00000000) # Program flash word stop address to 0x0
+            # self.write_memory_block32(base + FLASH_DATAW0, [0x00000000] * 8) # Prepare for read
+            # self.write32(base + FLASH_INT_CLR_STATUS, 0x0000000F) # Clear Flash controller status
+            # self.write32(base + FLASH_CMD, FLASH_CMD_READ_SINGLE_WORD) # Read single flash word
 
-            # Wait for flash word read to finish.
-            with timeout.Timeout(5.0) as t_o:
-                while t_o.check():
-                    if (self.read32(base + FLASH_INT_STATUS) & 0x00000004) != 0:
-                        break
-                    sleep(0.01)
+            # # Wait for flash word read to finish.
+            # with timeout.Timeout(5.0) as t_o:
+            #     while t_o.check():
+            #         if (self.read32(base + FLASH_INT_STATUS) & 0x00000004) != 0:
+            #             break
+            #         sleep(0.01)
             
-            # Check for error reading flash word.
-            if (self.read32(base + FLASH_INT_STATUS) & 0xB) == 0:
-                 # Read the reset vector address.
-                reset_vector = self.read32(0x00000004)
+            # # Check for error reading flash word.
+            # if (self.read32(base + FLASH_INT_STATUS) & 0xB) == 0:
+            #      # Read the reset vector address.
+            reset_vector = self.read32(0x00000004)
 
             # Break on user application reset vector if we have a valid breakpoint address.
             if reset_vector != 0xFFFFFFFF:
@@ -276,11 +351,14 @@ class CortexM_LPC5500(CortexM_v8M):
         if not self.call_delegate('will_reset', core=self, reset_type=reset_type):
             self._perform_reset(reset_type)
 
-        print("dupa")
+        # print("dupa")
 
-        if self._flash_erased:
+        # if self._flash_erased:
+        if True:
             print("Resynchronizing dm_ap")
             self.session.target.resynchronize_dm_ap()
+            self.session.target.halt()
+            
 
         self.call_delegate('did_reset', core=self, reset_type=reset_type)
 
