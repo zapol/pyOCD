@@ -45,6 +45,7 @@ FLASH_DATAW0            = 0x00034080
 FLASH_INT_STATUS        = 0x00034FE0
 FLASH_INT_CLR_STATUS    = 0x00034FE8
 FLASH_CMD_READ_SINGLE_WORD = 0x3
+FLASH_CMD_MARGIN_CHECK  = 0x6
 
 BOOTROM_MAGIC_ADDR      = 0x50000040
 
@@ -194,11 +195,11 @@ class CortexM_LPC5500(CortexM_v8M):
         # Use the flash programming model to check if the first flash page is readable, since
         # attempted accesses to erased pages result in bus faults. The start and stop address
         # are both set to 0x0 to probe the sector containing the reset vector.
-        self.write32(base + FLASH_STARTA, addr) # Program flash word start address to 0x0
-        self.write32(base + FLASH_STOPA, addr + length - 1) # Program flash word stop address to 0x0
+        self.write32(base + FLASH_STARTA, addr>>4) # Program flash word start address to 0x0
+        self.write32(base + FLASH_STOPA, (addr + length - 1)>>4) # Program flash word stop address to 0x0
         self.write_memory_block32(base + FLASH_DATAW0, [0x00000000] * 8) # Prepare for read
         self.write32(base + FLASH_INT_CLR_STATUS, 0x0000000F) # Clear Flash controller status
-        self.write32(base + FLASH_CMD, FLASH_CMD_READ_SINGLE_WORD) # Read single flash word
+        self.write32(base + FLASH_CMD, FLASH_CMD_MARGIN_CHECK) # Read single flash word
 
         # Wait for flash word read to finish.
         with timeout.Timeout(5.0) as t_o:
@@ -210,8 +211,6 @@ class CortexM_LPC5500(CortexM_v8M):
         # Check for error reading flash word.
         if (self.read32(base + FLASH_INT_STATUS) & 0xB) == 0:
             return False
-        
-        print("0x%08X %d bytes are Erased" % (addr, length))
         return True
 
 
