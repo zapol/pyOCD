@@ -96,7 +96,16 @@ class LPC5500Family(CoreSightTarget):
             except exceptions.TransferTimeoutError:
                 pass
         LOG.debug("Resync success")
+        self.start_debug_session()
 
+    def start_debug_session(self):
+        if 2 not in self.aps:
+            ap_address = APv1Address(2)
+            ap = AccessPort.create(self.dp, ap_address)
+        else:
+            ap = self.aps[2]
+
+        LOG.debug("Starting debug session")
         # Write DM START_DBG_SESSION to REQUEST register (1)
         ap.write_reg(0x04, 0x07)
         value = -1
@@ -270,32 +279,7 @@ class CortexM_LPC5500(CortexM_v8M):
             # Clear reset vector catch.
             self.write32(CortexM.DEMCR, self._reset_catch_saved_demcr & ~CortexM.DEMCR_VC_CORERESET)
             
-            # # If the processor is in Secure state, we have to access the flash controller
-            # # through the secure alias.
-            # if self.get_security_state() == Target.SecurityState.SECURE:
-            #     base = PERIPHERAL_BASE_S
-            # else:
-            #     base = PERIPHERAL_BASE_NS
-            
-            # # Use the flash programming model to check if the first flash page is readable, since
-            # # attempted accesses to erased pages result in bus faults. The start and stop address
-            # # are both set to 0x0 to probe the sector containing the reset vector.
-            # self.write32(base + FLASH_STARTA, 0x00000000) # Program flash word start address to 0x0
-            # self.write32(base + FLASH_STOPA, 0x00000000) # Program flash word stop address to 0x0
-            # self.write_memory_block32(base + FLASH_DATAW0, [0x00000000] * 8) # Prepare for read
-            # self.write32(base + FLASH_INT_CLR_STATUS, 0x0000000F) # Clear Flash controller status
-            # self.write32(base + FLASH_CMD, FLASH_CMD_READ_SINGLE_WORD) # Read single flash word
-
-            # # Wait for flash word read to finish.
-            # with timeout.Timeout(5.0) as t_o:
-            #     while t_o.check():
-            #         if (self.read32(base + FLASH_INT_STATUS) & 0x00000004) != 0:
-            #             break
-            #         sleep(0.01)
-            
-            # # Check for error reading flash word.
-            # if (self.read32(base + FLASH_INT_STATUS) & 0xB) == 0:
-            #      # Read the reset vector address.
+            # Read the reset vector address.
             reset_vector = self.read32(0x00000004)
 
             # Break on user application reset vector if we have a valid breakpoint address.
@@ -338,6 +322,8 @@ class CortexM_LPC5500(CortexM_v8M):
         """
         self.session.notify(Target.Event.PRE_RESET, self)
 
+        reset_type = Target.ResetType.SW_EMULATED
+
         reset_type = self._get_actual_reset_type(reset_type)
 
         LOG.debug("reset, core %d, type=%s", self.core_number, reset_type.name)
@@ -350,14 +336,10 @@ class CortexM_LPC5500(CortexM_v8M):
         if not self.call_delegate('will_reset', core=self, reset_type=reset_type):
             self._perform_reset(reset_type)
 
-        # print("dupa")
-
-        # if self._flash_erased:
-        if True:
+        if self._flash_erased:
             print("Resynchronizing dm_ap")
             self.session.target.resynchronize_dm_ap()
-            self.session.target.halt()
-            
+        self.halt()            
 
         self.call_delegate('did_reset', core=self, reset_type=reset_type)
 
